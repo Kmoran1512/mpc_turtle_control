@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+import matplotlib as plt
+from casadi import *
+from casadi.tools import *
+import pdb
+import sys, os
+
+import numpy as np
+import do_mpc
 
 import rclpy
 from rclpy.node import Node
@@ -21,52 +28,82 @@ from geometry_msgs.msg import Twist
 from turtlesim.msg import Pose
 
 
-class MinimalPublisher(Node):
-    MAX_VELOCITY = 1.0
-    MAX_TURN = 1.0
+from .mpc_model import mpc_model
+from .mpc_controller import mpc_controller
+from .mpc_simulator import mpc_simulator
 
-    def __init__(self, goal):
+
+class MpcNode(Node):
+    MAX_ANG_VEL = 1
+    MAX_LIN_VEL = 1
+    SPEED_FACTOR = 1
+    REFRESH_RATE = 1
+
+    def __init__(self, target_x, target_y):
         super().__init__("minimal_publisher")
 
-        self.goal = goal
+        self.iteration = 0
+        self.dt = 1
+        self.init = [0, 0, 0]
+        self.target = [target_x, target_y, 0]
+        self.input_constraints = [self.MAX_LIN_VEL, self.MAX_ANG_VEL]
 
-        self.publisher_ = self.create_publisher(Twist, "/turtle1/cmd_vel", 10)
+        self.isPositionSet = False
+
+        self.x = 0
+        self.y = 0
+        self.theta = 0
+
         self.subscription = self.create_subscription(
-            Pose, "/turtle1/pose", self.set_location, 5
+            Pose, "/turtle1/pose", self.setPose, 10
         )
-        timer_period = 0.5  # seconds
-        self.timer = self.create_timer(timer_period, self.publish_move)
+        self.publisher_ = self.create_publisher(Twist, "/turtle1/cmd_vel", 10)
 
-    def set_location(self, pose_msg):
-        self.location: Pose = pose_msg
+        self.model = mpc_model(self.dt, self.target)
+        self.mpc = mpc_controller(self.model, self.dt, self.input_constraints)
+        self.simulator = mpc_simulator(self.model, self.dt)
 
-    def publish_move(self):
-        msg = self.predictiveControl(self.location)
+        self.timer = self.create_timer(self.REFRESH_RATE, self.runMPC)
 
-        self.publisher_.publish(msg)
-        self.get_logger().info('Publishing: "%s"' % msg)
+    def runMPC(self):
+        if not self.isPositionSet:
+            return
 
-    def predictiveControl(self, position: Pose):
-        control = Twist()
-        if position.x < self.goal:
-            control.linear.x = self.MAX_VELOCITY
+        self.iteration += 1
+        x0 = self.simulator.x0
+        x0["x_pos"] = self.x
+        x0["y_pos"] = self.y
+        x0["theta_pos"] = self.theta
 
-        return control
+        self.mpc.x0 = x0
+        self.mpc.set_initial_guess()
+        u0 = self.mpc.make_step(x0)
+
+        pub_msg = Twist()
+        pub_msg.linear.x = u0[0][0] * self.SPEED_FACTOR
+        pub_msg.angular.z = u0[1][0] * self.SPEED_FACTOR
+        self.publisher_.publish(pub_msg)
+
+    def setPose(self, poseMsg: Pose):
+        self.x = poseMsg.x
+        self.y = poseMsg.y
+        self.theta = poseMsg.theta
+
+        self.isPositionSet = True
 
 
 def main(args=None):
-    goal = float(input("goal x"))
+    goal_x = float(input("goal x: "))
+    goal_y = float(input("goal y: "))
 
     rclpy.init(args=args)
 
-    minimal_publisher = MinimalPublisher(goal)
+    controller = MpcNode(goal_x, goal_y)
+    print("ready for take off")
 
-    rclpy.spin(minimal_publisher)
+    rclpy.spin(controller)
 
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    minimal_publisher.destroy_node()
+    controller.destroy_node()
     rclpy.shutdown()
 
 
